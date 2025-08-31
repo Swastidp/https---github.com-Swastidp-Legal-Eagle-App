@@ -1,9 +1,10 @@
-# utils/legal_processors.py
+# utils/legal_processors.py - STREAMLIT CLOUD COMPATIBLE
 import streamlit as st
-import spacy
 import re
 from sentence_transformers import SentenceTransformer
 from typing import Dict, List, Any
+import subprocess
+import sys
 
 class LegalNLPProcessor:
     def __init__(self):
@@ -20,28 +21,48 @@ class LegalNLPProcessor:
     @property
     def nlp(self):
         if self._nlp is None:
-            with st.spinner("Loading spaCy model..."):
-                self._nlp = spacy.load("en_core_web_sm")
+            try:
+                import spacy
+                with st.spinner("Loading spaCy model..."):
+                    self._nlp = spacy.load("en_core_web_sm")
+            except (ImportError, OSError):
+                # Fallback: Download and install spaCy model
+                st.info("Installing spaCy model for first-time use...")
+                try:
+                    subprocess.check_call([
+                        sys.executable, "-m", "pip", "install", 
+                        "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl"
+                    ])
+                    import spacy
+                    self._nlp = spacy.load("en_core_web_sm")
+                except Exception as e:
+                    st.warning(f"spaCy model installation failed: {e}")
+                    st.warning("Using regex-only entity extraction...")
+                    self._nlp = None
         return self._nlp
     
     def extract_legal_entities(self, text: str) -> Dict[str, List[Any]]:
-        """Extract legal entities using spaCy + enhanced regex patterns"""
-        doc = self.nlp(text)
+        """Extract legal entities using spaCy + enhanced regex patterns (with fallback)"""
         
-        # Extract organizations and people using spaCy
+        # Try spaCy first
         companies = []
         people = []
         spacy_dates = []
         
-        for ent in doc.ents:
-            if ent.label_ == "ORG":
-                companies.append(ent.text)
-            elif ent.label_ == "PERSON":
-                people.append(ent.text)
-            elif ent.label_ == "DATE":
-                spacy_dates.append(ent.text)
+        if self.nlp is not None:
+            try:
+                doc = self.nlp(text)
+                for ent in doc.ents:
+                    if ent.label_ == "ORG":
+                        companies.append(ent.text)
+                    elif ent.label_ == "PERSON":
+                        people.append(ent.text)
+                    elif ent.label_ == "DATE":
+                        spacy_dates.append(ent.text)
+            except Exception as e:
+                st.warning(f"spaCy processing failed: {e}")
         
-        # Enhanced regex patterns for legal entities
+        # Enhanced regex patterns (works with or without spaCy)
         company_patterns = [
             r'\b[A-Z][a-zA-Z\s&,.]+(Inc\.?|LLC|Corp\.?|Company|Co\.?|Ltd\.?)\b',
             r'\b[A-Z][a-zA-Z\s&,.]+(?:Corporation|Partnership|LLP|LP)\b',
@@ -52,6 +73,16 @@ class LegalNLPProcessor:
         for pattern in company_patterns:
             matches = re.findall(pattern, text)
             companies.extend(matches)
+        
+        # People patterns (regex fallback)
+        people_patterns = [
+            r'\b(?:Mr\.?|Ms\.?|Mrs\.?|Dr\.?)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b',
+            r'\b[A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+(?:Jr\.?|Sr\.?|III|IV))?\b'
+        ]
+        
+        for pattern in people_patterns:
+            matches = re.findall(pattern, text)
+            people.extend(matches)
         
         # Money patterns
         money_patterns = [
@@ -66,15 +97,16 @@ class LegalNLPProcessor:
             matches = re.findall(pattern, text, re.IGNORECASE)
             money.extend(matches)
         
-        # Combine spaCy dates with additional regex patterns
+        # Date patterns (regex fallback)
         date_patterns = [
             r'\b\d{1,2}/\d{1,2}/\d{4}\b',  # MM/DD/YYYY
             r'\b\d{1,2}-\d{1,2}-\d{4}\b',  # MM-DD-YYYY
+            r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b'
         ]
         
         regex_dates = []
         for pattern in date_patterns:
-            matches = re.findall(pattern, text)
+            matches = re.findall(pattern, text, re.IGNORECASE)
             regex_dates.extend(matches)
         
         all_dates = spacy_dates + regex_dates
