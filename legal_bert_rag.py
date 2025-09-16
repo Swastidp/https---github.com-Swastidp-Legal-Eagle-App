@@ -3,6 +3,7 @@
 # Healthcheck/client guards + citations + snippet fallback
 # Chunk metadata: page and paragraph numbers in citations and Sources
 # Resilient retrieval: fallback to document paragraphs if embeddings/index are empty
+# Page mapping: detect "=== PAGE n ===" delimiters and map chunk start offsets to page numbers
 
 from __future__ import annotations
 
@@ -70,6 +71,9 @@ class LegalBERTRAG:
         # Keep a raw head for last-ditch fallback
         self.raw_doc_text: str = ""
 
+        # Track page start offsets (absolute char positions) for mapping chunk starts to pages
+        self._page_starts: List[int] = [0]
+
         # Clients and errors
         self.gclient = None
         self.client = None
@@ -118,7 +122,7 @@ class LegalBERTRAG:
                 choices = resp.get("choices")
             if not choices or len(choices) == 0:
                 return None
-            c0 = choices
+            c0 = choices[0]
 
             msg = getattr(c0, "message", None)
             if msg is None and isinstance(c0, dict):
@@ -165,6 +169,23 @@ class LegalBERTRAG:
         except Exception:
             return None
 
+    # ---------------- Page start offsets from extractor delimiters ----------------
+    def _compute_page_starts(self, text: str) -> List[int]:
+        """
+        Detect "=== PAGE n ===" delimiters (inserted by extractor) and return absolute
+        char offsets where each page's content starts. Always include offset 0 for page 1.
+        """
+        starts = [0]
+        if not isinstance(text, str) or not text:
+            return starts
+        # Match delimiter lines like "\n\n=== PAGE 3 ===\n\n" robustly
+        for m in re.finditer(r"\n\s*===\s*PAGE\s+(\d+)\s*===\s*\n", text, flags=re.IGNORECASE):
+            # Content starts immediately after the delimiter
+            pos = m.end()
+            starts.append(pos)
+        starts = sorted(set(starts))
+        return starts
+
     # ---------------- Healthcheck ----------------
     def healthcheck(self) -> str:
         model = _get_chat_model_name()
@@ -194,8 +215,10 @@ class LegalBERTRAG:
         text = HybridExtractor().extract(file_name, file_buffer)
         if not text:
             return None
-        # Keep raw text head as a last-ditch fallback
+        # Keep raw text head and page starts for fallbacks/mapping
         self.raw_doc_text = text[:4000] if isinstance(text, str) else ""
+        self._page_starts = self._compute_page_starts(text)
+
         entities = self.legal_processor.extract_legal_entities(text)
         doc_type = self.legal_processor.analyze_document_type(text)
         return Document(
@@ -231,45 +254,99 @@ class LegalBERTRAG:
                 return False
         return False
 
-    # ---------------- Section-aware chunking with paragraph metadata ----------------
+    # ---------------- Section-aware chunking with paragraph + page mapping ----------------
     def _smart_chunk(self, text: str) -> Tuple[List[str], List[Dict[str, int]]]:
         """
         Returns chunks and metadata: [{"page": int, "para": int}, ...]
-        Page is -1 by default (unknown without extractor refactor); paragraph is the
-        index of the base unit from which the chunk was created.
+        Page is derived by mapping the chunk's absolute start char offset
+        to the latest page start offset (1-based page number).
+        Paragraph is the base unit index.
         """
         if not isinstance(text, str) or not text.strip():
             return [], []
 
+        page_starts = getattr(self, "_page_starts", [0])
+
+        def offset_to_page(off: int) -> int:
+            if not page_starts:
+                return 1
+            lo, hi = 0, len(page_starts) - 1
+            ans = 0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if page_starts[mid] <= off:
+                    ans = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            return ans + 1  # 1-based
+
+        # Section/paragraph segmentation while tracking absolute spans
         pattern = r"(?im)^\s*(?:section|article|clause)\s+\d+[.:)]|\bwhereas\b"
-        sec_split = re.split(pattern, text)
-        parts = [p.strip() for p in sec_split if isinstance(p, str) and p is not None and p.strip()]
-        if parts and len(" ".join(parts)) > 0:
-            base_units = parts
-        else:
-            base_units = [p.strip() for p in re.split(r"\n{2,}", text) if isinstance(p, str) and p.strip()]
+        parts: List[str] = []
+        spans: List[Tuple[int, int]] = []  # absolute (start, end)
 
-        chunks, metas = [], []
+        last_end = 0
+        for m in re.finditer(pattern, text):
+            seg = text[last_end:m.start()]
+            if seg.strip():
+                start_off = last_end
+                end_off = m.start()
+                parts.append(seg.strip())
+                spans.append((start_off, end_off))
+            last_end = m.start()
+        tail = text[last_end:]
+        if tail.strip():
+            parts.append(tail.strip())
+            spans.append((last_end, len(text)))
 
-        buf, cur_para = "", 0
-        for para_idx, unit in enumerate(base_units):
+        if not parts:
+            # Fallback: double-newline paragraphs with approximate spans
+            parts = [p.strip() for p in re.split(r"\n{2,}", text) if isinstance(p, str) and p.strip()]
+            spans = []
+            walk = 0
+            for p in parts:
+                idx = text.find(p, walk)
+                if idx < 0:
+                    idx = walk
+                spans.append((idx, idx + len(p)))
+                walk = idx + len(p)
+
+        chunks: List[str] = []
+        metas: List[Dict[str, int]] = []
+        buf, buf_start_off = "", None
+
+        for para_idx, (unit, (u_start, u_end)) in enumerate(zip(parts, spans)):
+            unit_cursor = u_start
             sentences = [s for s in re.split(r"(?<=[.!?])\s+", unit) if isinstance(s, str) and s]
             for sent in sentences:
+                s_idx = text.find(sent, unit_cursor)
+                if s_idx < 0:
+                    s_idx = unit_cursor
+                if not buf:
+                    buf_start_off = s_idx
                 if len(buf) + len(sent) + 1 <= 1400:
                     buf = f"{buf} {sent}".strip()
                 else:
                     if len(buf) > 50:
+                        page = offset_to_page(buf_start_off or u_start)
                         chunks.append(buf)
-                        metas.append({"page": -1, "para": para_idx})
+                        metas.append({"page": page, "para": para_idx})
                     buf = sent
+                    buf_start_off = s_idx
                 if len(buf) > 800:
+                    page = offset_to_page(buf_start_off or s_idx)
                     chunks.append(buf)
-                    metas.append({"page": -1, "para": para_idx})
+                    metas.append({"page": page, "para": para_idx})
                     buf = ""
-            cur_para = para_idx
+                    buf_start_off = None
+                unit_cursor = s_idx + len(sent)
+
         if len(buf) > 50:
+            page = offset_to_page(buf_start_off or (spans[-1][0] if spans else 0))
             chunks.append(buf)
-            metas.append({"page": -1, "para": cur_para})
+            metas.append({"page": page, "para": len(parts) - 1 if parts else 0})
+
         return chunks, metas
 
     # ---------------- Build FAISS HNSW ----------------
@@ -298,7 +375,7 @@ class LegalBERTRAG:
             embs = np.asarray(embs, dtype="float32")
             if embs.ndim == 1:
                 embs = embs.reshape(1, -1)
-            if embs.ndim != 2 or embs.shape != len(chunks) or embs.shape[5] <= 0:
+            if embs.ndim != 2 or embs.shape[0] != len(chunks) or embs.shape[1] <= 0:
                 self.chunk_embeddings = np.zeros((0, 768), dtype="float32")
                 self._faiss = None
                 return self
@@ -310,8 +387,8 @@ class LegalBERTRAG:
         if loaded and self._faiss is not None and self._faiss.ntotal == len(chunks):
             return self
 
-        # Correct embedding dimensionality (vector dim is axis 1) [1][4]
-        d = int(self.chunk_embeddings.shape[5])
+        # Correct embedding dimensionality (vector dim is axis 1)
+        d = int(self.chunk_embeddings.shape[1])
         if d <= 0:
             self._faiss = None
             return self
@@ -349,7 +426,7 @@ class LegalBERTRAG:
                     return content.strip()
 
                 try:
-                    c0 = resp.choices
+                    c0 = resp.choices[0]
                     if hasattr(c0, "message") and getattr(c0.message, "content", None):
                         alt = c0.message.content
                         if isinstance(alt, str) and alt.strip():
@@ -374,7 +451,7 @@ class LegalBERTRAG:
             if self.raw_doc_text:
                 fallback_chunk = self.raw_doc_text[:1400]
                 self.document_chunks = [fallback_chunk]
-                self.chunk_meta = [{"page": -1, "para": 0}]
+                self.chunk_meta = [{"page": 1, "para": 0}]
             else:
                 return "I don't have enough relevant information in the document to answer that question."
 
@@ -391,14 +468,13 @@ class LegalBERTRAG:
 
             # Fallback path if similarities are empty -> use first paragraphs
             if sims.size == 0:
-                # Take first up to 3 chunks as context
                 max_fallback = min(3, len(self.document_chunks))
                 for i in range(max_fallback):
                     txt = self.document_chunks[i]
-                    meta = self.chunk_meta[i] if 0 <= i < len(self.chunk_meta) else {"page": -1, "para": i}
+                    meta = self.chunk_meta[i] if 0 <= i < len(self.chunk_meta) else {"page": 1, "para": i}
                     retrieved.append(RetrievedChunk(
                         idx=i, score=0.0, start=0, end=len(txt), text=txt,
-                        page=int(meta.get("page", -1)), para=int(meta.get("para", i))
+                        page=int(meta.get("page", 1)), para=int(meta.get("para", i))
                     ))
             else:
                 k = min(8, sims.size)
@@ -408,10 +484,10 @@ class LegalBERTRAG:
                     if sc < 0.15:
                         continue
                     txt = self.document_chunks[int(ii)]
-                    meta = self.chunk_meta[int(ii)] if 0 <= int(ii) < len(self.chunk_meta) else {"page": -1, "para": -1}
+                    meta = self.chunk_meta[int(ii)] if 0 <= int(ii) < len(self.chunk_meta) else {"page": 1, "para": -1}
                     retrieved.append(RetrievedChunk(
                         idx=int(ii), score=sc, start=0, end=len(txt), text=txt,
-                        page=int(meta.get("page", -1)), para=int(meta.get("para", -1))
+                        page=int(meta.get("page", 1)), para=int(meta.get("para", -1))
                     ))
         else:
             q = self.sentence_model.encode([query]).astype("float32")
@@ -424,17 +500,17 @@ class LegalBERTRAG:
                 if ii < 0 or sc < 0.15:
                     continue
                 txt = self.document_chunks[int(ii)]
-                meta = self.chunk_meta[int(ii)] if 0 <= int(ii) < len(self.chunk_meta) else {"page": -1, "para": -1}
+                meta = self.chunk_meta[int(ii)] if 0 <= int(ii) < len(self.chunk_meta) else {"page": 1, "para": -1}
                 retrieved.append(RetrievedChunk(
                     idx=int(ii), score=float(sc), start=0, end=len(txt), text=txt,
-                    page=int(meta.get("page", -1)), para=int(meta.get("para", -1))
+                    page=int(meta.get("page", 1)), para=int(meta.get("para", -1))
                 ))
 
         if not retrieved:
             # Absolute final fallback: use raw_doc_text head
             if self.raw_doc_text:
                 txt = self.raw_doc_text[:1400]
-                retrieved = [RetrievedChunk(idx=0, score=0.0, start=0, end=len(txt), text=txt, page=-1, para=0)]
+                retrieved = [RetrievedChunk(idx=0, score=0.0, start=0, end=len(txt), text=txt, page=1, para=0)]
             else:
                 return "I don't have enough relevant information in the document to answer that question."
 
@@ -450,7 +526,7 @@ class LegalBERTRAG:
         context = "\n\n".join(context_parts).strip()
         if not context:
             # Final guard
-            first_text = retrieved.text if retrieved else (self.raw_doc_text[:1400] if self.raw_doc_text else "")
+            first_text = retrieved[0].text if retrieved else (self.raw_doc_text[:1400] if self.raw_doc_text else "")
             if not first_text:
                 return "I don't have enough relevant information in the document to answer that question."
             context = f"[Chunk 0] {first_text}"

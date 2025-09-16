@@ -1,4 +1,4 @@
-# main.py — Streamlit app with preflight Q&A checks, enriched Legal Entities (relations/roles), friendly fallbacks, and Sources
+# main.py — Streamlit app with preflight Q&A checks, clean entity names only, friendly fallbacks, and Sources
 
 from __future__ import annotations
 
@@ -135,84 +135,43 @@ if st.session_state.analysis_complete and st.session_state.legal_doc:
         st.metric("Money References", doc.meta["entity_counts"]["money"])
         st.metric("Word Count", len(doc.content.split()))
 
-    # Entities (enriched with roles/relations when available)
+    # Entities (clean names only, no descriptions)
     with st.expander("📋 Legal Entities Detected"):
         entities = doc.meta["legal_entities"]
 
-        # Try structured roles/relations first; fall back to basic lists
-        roles = None
-        try:
-            roles = st.session_state.legal_rag.legal_processor.extract_people_companies_with_roles(doc.content)
-        except Exception:
-            roles = None
-
-        # Companies with role/mentions
+        # Companies
         st.write("**🏢 Companies:**")
-        companies_shown = 0
-        if roles and isinstance(roles.get("companies"), list) and roles["companies"]:
-            for c in roles["companies"][:8]:
-                name = c.get("name") or ""
-                role = c.get("role_in_document") or ""
-                mentions = c.get("mentions") or []
-                detail = role.strip() if role.strip() else (mentions[0].strip() if mentions and str(mentions[0]).strip() else "")
-                st.write(f"• {name}")
-                if detail:
-                    st.caption(detail)
-                companies_shown += 1
-        else:
-            for company in entities.get("companies", [])[:8]:
+        companies = entities.get("companies") or []
+        if companies:
+            for company in companies[:8]:
                 st.write(f"• {company}")
-                companies_shown += 1
-        if companies_shown == 0:
+        else:
             st.caption("No companies detected.")
 
-        # People with relation/designation/org/mentions
+        # People
         st.write("**👤 People:**")
-        people_shown = 0
-        if roles and isinstance(roles.get("people"), list) and roles["people"]:
-            for p in roles["people"][:8]:
-                name = p.get("name") or ""
-                relation = p.get("relation") or ""
-                designation = p.get("designation") or ""
-                org = p.get("organization") or ""
-                mentions = p.get("mentions") or []
-                # Compose a helpful one-liner: prefer relation, else designation/org, else first mention
-                if relation.strip():
-                    detail = relation.strip()
-                elif designation.strip() and org.strip():
-                    detail = f"{designation.strip()} at {org.strip()}"
-                elif designation.strip():
-                    detail = designation.strip()
-                elif org.strip():
-                    detail = f"Associated with {org.strip()}"
-                else:
-                    detail = mentions[0].strip() if mentions and str(mentions[0]).strip() else ""
-                st.write(f"• {name}")
-                if detail:
-                    st.caption(detail)
-                people_shown += 1
-        else:
-            for person in entities.get("people", [])[:8]:
+        people = entities.get("people") or []
+        if people:
+            for person in people[:8]:
                 st.write(f"• {person}")
-                people_shown += 1
-        if people_shown == 0:
+        else:
             st.caption("No people detected.")
 
         # Dates
         st.write("**📅 Important Dates:**")
-        dates_list = entities.get("dates") or []
-        if dates_list:
-            for date in dates_list[:8]:
+        dates = entities.get("dates") or []
+        if dates:
+            for date in dates[:8]:
                 st.write(f"• {date}")
         else:
             st.caption("No dates detected.")
 
         # Money
         st.write("**💰 Financial References:**")
-        money_list = entities.get("money") or []
-        if money_list:
-            for money in money_list[:8]:
-                st.write(f"• {money}")
+        money = entities.get("money") or []
+        if money:
+            for amount in money[:8]:
+                st.write(f"• {amount}")
         else:
             st.caption("No money references detected.")
 
@@ -246,9 +205,8 @@ if st.session_state.analysis_complete and st.session_state.legal_doc:
             or st.session_state.retriever is None
             or st.session_state.legal_doc is None
         ):
-            st.warning("Analyzer is not ready. Please click “Analyze with Legal AI” first.")
+            st.warning('Analyzer is not ready. Please click "Analyze with Legal AI" first.')
         else:
-            # Defensive UX: always provide friendly text and avoid raw exception leakage
             answer = None
             try:
                 with st.spinner("Generating legal analysis..."):
@@ -257,7 +215,6 @@ if st.session_state.analysis_complete and st.session_state.legal_doc:
                 st.warning("The model response was unavailable. Showing the most relevant source snippets instead.")
                 answer = ""
 
-            # Guarantee a user-friendly answer string
             if not answer or not str(answer).strip():
                 answer = "Unable to generate a model answer; showing the most relevant source snippets identified."
 
@@ -282,7 +239,6 @@ if st.session_state.analysis_complete and st.session_state.legal_doc:
                     with st.expander(f"Chunk {rc.idx} • page {page} • para {para} • score={rc.score:.2f} • chars {rc.start}-{rc.end}"):
                         st.write(rc.text)
 
-            # Clear the quick-prompt button text for the next turn
             if "current_question" in st.session_state:
                 del st.session_state.current_question
 else:
@@ -297,7 +253,7 @@ st.markdown(
 - **Basic Mode**: Hybrid OCR + text extraction for all document types
 - **Legal AI Mode**: InLegalBERT embeddings + entity extraction + intelligent Q&A
 - **Document Types**: PDF, DOCX, RTF, TXT with OCR fallback
-- **Legal Entities**: Companies, people, dates, financial amounts
+- **Clean Entity Display**: Names only, no generic descriptions
 - **Smart Classification**: Contract, filing, corporate, insurance, real estate documents
 """
 )
