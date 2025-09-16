@@ -1,6 +1,8 @@
-# legal_bert_rag.py — Native Gemini primary + OpenAI-compat fallback
-# FAISS HNSW (persistent) + section-aware chunking + robust compat parsing fix
+# legal_bert_rag.py — Gemini primary + OpenAI-compat fallback (hardened)
+# FAISS HNSW (persistent) + section-aware chunking + robust compat parsing + retries
 # Healthcheck/client guards + citations + snippet fallback
+# Chunk metadata: page and paragraph numbers in citations and Sources
+# Resilient retrieval: fallback to document paragraphs if embeddings/index are empty
 
 from __future__ import annotations
 
@@ -9,7 +11,7 @@ import re
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Tuple, Dict
 
 import numpy as np
 import streamlit as st
@@ -47,26 +49,35 @@ class RetrievedChunk:
     start: int
     end: int
     text: str
+    page: int = -1
+    para: int = -1
 
 
 class LegalBERTRAG:
     def __init__(self, api_key: Optional[str] = None):
         self.legal_processor = LegalNLPProcessor()
-
         key_from_secrets = st.secrets.get("GEMINI_API_KEY") if hasattr(st, "secrets") else None
         self.api_key = api_key or key_from_secrets or os.getenv("GEMINI_API_KEY")
 
         # RAG state
         self.document_chunks: List[str] = []
+        self.chunk_meta: List[Dict[str, int]] = []  # {"page": int, "para": int}
         self.chunk_embeddings: np.ndarray = np.zeros((0, 768), dtype=np.float32)
         self._sentence_model = None
         self._faiss = None
         self._last_retrieved: List[RetrievedChunk] = []
 
+        # Keep a raw head for last-ditch fallback
+        self.raw_doc_text: str = ""
+
         # Clients and errors
         self.gclient = None
         self.client = None
         self._client_error = None
+
+        # Retry/timeout config
+        self._timeout = float(os.getenv("GENAI_TIMEOUT", "30"))
+        self._retries = int(os.getenv("GENAI_RETRIES", "2"))
 
         # Native client first
         if not self.api_key:
@@ -77,17 +88,19 @@ class LegalBERTRAG:
             except Exception as e:
                 self._client_error = f"Native client init failed: {e}"
 
-            if OpenAI is not None:
-                try:
-                    self.client = OpenAI(
-                        api_key=self.api_key,
-                        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-                    )
-                except Exception as e:
-                    if self._client_error:
-                        self._client_error += f" | Compat init failed: {e}"
-                    else:
-                        self._client_error = f"Compat init failed: {e}"
+        # OpenAI-compat client (fallback)
+        if OpenAI is not None and self.api_key:
+            try:
+                self.client = OpenAI(
+                    api_key=self.api_key,
+                    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                    timeout=self._timeout,
+                )
+            except Exception as e:
+                if self._client_error:
+                    self._client_error += f" | Compat init failed: {e}"
+                else:
+                    self._client_error = f"Compat init failed: {e}"
 
     @property
     def sentence_model(self):
@@ -96,48 +109,35 @@ class LegalBERTRAG:
                 self._sentence_model = get_embedder()
         return self._sentence_model
 
-    # ---------- Utilities: strict compat parser ----------
+    # ---------- Utilities: fully permissive compat parser ----------
     @staticmethod
     def _parse_compat_content(resp: Any) -> str | None:
-        """
-        Strict, ordered extraction for OpenAI-compat responses.
-        Prefers choices[0].message.content, then dict fallbacks, then .text.
-        Returns a stripped string or None if not present.
-        """
         try:
             choices = getattr(resp, "choices", None)
             if choices is None and isinstance(resp, dict):
                 choices = resp.get("choices")
-            if not choices:
+            if not choices or len(choices) == 0:
                 return None
+            c0 = choices
 
-            c0 = choices[0]
-
-            # 1) Attribute path: choices[0].message.content
-            if hasattr(c0, "message") and getattr(c0, "message") is not None:
-                m = getattr(c0, "message")
-                content = getattr(m, "content", None)
-                if isinstance(content, str) and content.strip():
-                    return content.strip()
-                # Some SDKs return list parts; join strings
-                if isinstance(content, list):
-                    parts = [p for p in content if isinstance(p, str)]
-                    if parts:
-                        return "".join(parts).strip()
-
-            # 2) Dict-style path
-            if isinstance(c0, dict):
+            msg = getattr(c0, "message", None)
+            if msg is None and isinstance(c0, dict):
                 msg = c0.get("message")
-                if isinstance(msg, dict):
-                    content = msg.get("content")
-                    if isinstance(content, str) and content.strip():
-                        return content.strip()
-                    if isinstance(content, list):
-                        parts = [p for p in content if isinstance(p, str)]
-                        if parts:
-                            return "".join(parts).strip()
 
-            # 3) Non-chat fallback: choices[0].text
+            content = None
+            if msg is not None:
+                content = getattr(msg, "content", None)
+                if content is None and isinstance(msg, dict):
+                    content = msg.get("content")
+
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+
+            if isinstance(content, list):
+                parts = [p for p in content if isinstance(p, str)]
+                if parts:
+                    return "".join(parts).strip()
+
             txt = getattr(c0, "text", None)
             if isinstance(txt, str) and txt.strip():
                 return txt.strip()
@@ -145,6 +145,21 @@ class LegalBERTRAG:
                 txt = c0.get("text")
                 if isinstance(txt, str) and txt.strip():
                     return txt.strip()
+
+            try:
+                to_dict = getattr(msg, "to_dict", None)
+                if callable(to_dict):
+                    d = to_dict()
+                    if isinstance(d, dict):
+                        c = d.get("content")
+                        if isinstance(c, str) and c.strip():
+                            return c.strip()
+                        if isinstance(c, list):
+                            parts = [p for p in c if isinstance(p, str)]
+                            if parts:
+                                return "".join(parts).strip()
+            except Exception:
+                pass
 
             return None
         except Exception:
@@ -156,7 +171,8 @@ class LegalBERTRAG:
         if self.gclient:
             try:
                 r = self.gclient.models.generate_content(model=model, contents="Reply with OK")
-                return (getattr(r, "text", "") or "").strip() or "EMPTY"
+                txt = (getattr(r, "text", "") or "").strip().upper()
+                return "OK" if "OK" in txt else (txt or "EMPTY")
             except Exception as e:
                 return f"ERR:{e}"
         if self.client:
@@ -167,8 +183,8 @@ class LegalBERTRAG:
                     max_tokens=5,
                     temperature=0.0,
                 )
-                content = self._parse_compat_content(resp)
-                return content or "EMPTY"
+                content = (self._parse_compat_content(resp) or "").strip().upper()
+                return "OK" if "OK" in content else (content or "EMPTY")
             except Exception as e:
                 return f"ERR:{e}"
         return f"ERR:{self._client_error or 'Clients not initialized'}"
@@ -178,10 +194,10 @@ class LegalBERTRAG:
         text = HybridExtractor().extract(file_name, file_buffer)
         if not text:
             return None
-
+        # Keep raw text head as a last-ditch fallback
+        self.raw_doc_text = text[:4000] if isinstance(text, str) else ""
         entities = self.legal_processor.extract_legal_entities(text)
         doc_type = self.legal_processor.analyze_document_type(text)
-
         return Document(
             content=text,
             meta={
@@ -215,21 +231,28 @@ class LegalBERTRAG:
                 return False
         return False
 
-    # ---------------- Section-aware chunking (fixed) ----------------
-    def _smart_chunk(self, text: str) -> List[str]:
+    # ---------------- Section-aware chunking with paragraph metadata ----------------
+    def _smart_chunk(self, text: str) -> Tuple[List[str], List[Dict[str, int]]]:
+        """
+        Returns chunks and metadata: [{"page": int, "para": int}, ...]
+        Page is -1 by default (unknown without extractor refactor); paragraph is the
+        index of the base unit from which the chunk was created.
+        """
         if not isinstance(text, str) or not text.strip():
-            return []
+            return [], []
+
         pattern = r"(?im)^\s*(?:section|article|clause)\s+\d+[.:)]|\bwhereas\b"
         sec_split = re.split(pattern, text)
         parts = [p.strip() for p in sec_split if isinstance(p, str) and p is not None and p.strip()]
-
         if parts and len(" ".join(parts)) > 0:
             base_units = parts
         else:
             base_units = [p.strip() for p in re.split(r"\n{2,}", text) if isinstance(p, str) and p.strip()]
 
-        chunks, buf = [], ""
-        for unit in base_units:
+        chunks, metas = [], []
+
+        buf, cur_para = "", 0
+        for para_idx, unit in enumerate(base_units):
             sentences = [s for s in re.split(r"(?<=[.!?])\s+", unit) if isinstance(s, str) and s]
             for sent in sentences:
                 if len(buf) + len(sent) + 1 <= 1400:
@@ -237,65 +260,159 @@ class LegalBERTRAG:
                 else:
                     if len(buf) > 50:
                         chunks.append(buf)
+                        metas.append({"page": -1, "para": para_idx})
                     buf = sent
-            if len(buf) > 800:
-                chunks.append(buf)
-                buf = ""
+                if len(buf) > 800:
+                    chunks.append(buf)
+                    metas.append({"page": -1, "para": para_idx})
+                    buf = ""
+            cur_para = para_idx
         if len(buf) > 50:
             chunks.append(buf)
-        return chunks
+            metas.append({"page": -1, "para": cur_para})
+        return chunks, metas
 
     # ---------------- Build FAISS HNSW ----------------
     def setup_retriever(self, doc: Document) -> "LegalBERTRAG":
         loaded = self.try_load_index(doc)
-
-        chunks = self._smart_chunk((doc.content or ""))
+        chunks, metas = self._smart_chunk((doc.content or ""))
         self.document_chunks = chunks
+        self.chunk_meta = metas
 
+        # If nothing to index, clear state and return early
         if not chunks:
             self.chunk_embeddings = np.zeros((0, 768), dtype=np.float32)
             self._faiss = None
             return self
 
+        # Keep meta aligned with chunks length
+        if len(self.chunk_meta) != len(self.document_chunks):
+            if len(self.chunk_meta) < len(self.document_chunks):
+                pad_count = len(self.document_chunks) - len(self.chunk_meta)
+                self.chunk_meta.extend([{"page": -1, "para": -1}] * pad_count)
+            else:
+                self.chunk_meta = self.chunk_meta[:len(self.document_chunks)]
+
         with st.spinner("Creating document embeddings..."):
             embs = self.sentence_model.encode(chunks).astype("float32")
-            faiss.normalize_L2(embs)  # cosine via inner product
+            embs = np.asarray(embs, dtype="float32")
+            if embs.ndim == 1:
+                embs = embs.reshape(1, -1)
+            if embs.ndim != 2 or embs.shape != len(chunks) or embs.shape[5] <= 0:
+                self.chunk_embeddings = np.zeros((0, 768), dtype="float32")
+                self._faiss = None
+                return self
+
+            faiss.normalize_L2(embs)
             self.chunk_embeddings = embs
 
+        # Reuse on-disk index only if it matches the chunk count
         if loaded and self._faiss is not None and self._faiss.ntotal == len(chunks):
             return self
 
-        d = self.chunk_embeddings.shape[1]
+        # Correct embedding dimensionality (vector dim is axis 1) [1][4]
+        d = int(self.chunk_embeddings.shape[5])
+        if d <= 0:
+            self._faiss = None
+            return self
+
         M = 64
         index = faiss.IndexHNSWFlat(d, M, faiss.METRIC_INNER_PRODUCT)
         index.hnsw.efConstruction = 128
         index.hnsw.efSearch = 64
         index.add(self.chunk_embeddings)
         self._faiss = index
-
-        faiss.write_index(self._faiss, self._index_path(doc))
+        try:
+            faiss.write_index(self._faiss, self._index_path(doc))
+        except Exception:
+            pass
         return self
 
-    # ---------------- Query with citations ----------------
+    # ---------------- Internal: compat chat with retries ----------------
+    def _compat_chat(self, model: str, system_prompt: str, user_prompt: str) -> str | None:
+        if not self.client:
+            return None
+        last_err: Any = None
+        for _ in range(self._retries + 1):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=800,
+                    temperature=0.1,
+                )
+                content = self._parse_compat_content(resp)
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+
+                try:
+                    c0 = resp.choices
+                    if hasattr(c0, "message") and getattr(c0.message, "content", None):
+                        alt = c0.message.content
+                        if isinstance(alt, str) and alt.strip():
+                            return alt.strip()
+                        if isinstance(alt, list):
+                            parts = [p for p in alt if isinstance(p, str)]
+                            if parts:
+                                return "".join(parts).strip()
+                    if hasattr(c0, "text") and isinstance(c0.text, str) and c0.text.strip():
+                        return c0.text.strip()
+                except Exception:
+                    pass
+                last_err = ValueError("Empty compat content")
+            except Exception as e:
+                last_err = e
+        return None  # triggers snippet fallback
+
+    # ---------------- Query with citations (resilient) ----------------
     def query_document(self, retriever: "LegalBERTRAG", query: str) -> str:
         if not self.document_chunks:
-            return "No document content available for querying."
+            # Last-ditch: try to chunk raw head for some context
+            if self.raw_doc_text:
+                fallback_chunk = self.raw_doc_text[:1400]
+                self.document_chunks = [fallback_chunk]
+                self.chunk_meta = [{"page": -1, "para": 0}]
+            else:
+                return "I don't have enough relevant information in the document to answer that question."
 
         # Retrieval
+        retrieved: List[RetrievedChunk] = []
+
         if getattr(self, "_faiss", None) is None or getattr(self.chunk_embeddings, "size", 0) == 0:
-            q = self.sentence_model.encode([query]).astype("float32")
-            sims = cosine_similarity(q, self.chunk_embeddings).ravel() if self.chunk_embeddings.size else np.array([])
+            # No FAISS or no embeddings: attempt cosine with whatever is loaded
+            if self.chunk_embeddings.size > 0:
+                q = self.sentence_model.encode([query]).astype("float32")
+                sims = cosine_similarity(q, self.chunk_embeddings).ravel()
+            else:
+                sims = np.array([])
+
+            # Fallback path if similarities are empty -> use first paragraphs
             if sims.size == 0:
-                return "Document is too short for retrieval or index not ready."
-            k = min(8, sims.size)
-            top = np.argsort(sims)[-k:][::-1]
-            retrieved = []
-            for ii in top:
-                sc = float(sims[ii])
-                if sc < 0.25:
-                    continue
-                txt = self.document_chunks[int(ii)]
-                retrieved.append(RetrievedChunk(idx=int(ii), score=sc, start=0, end=len(txt), text=txt))
+                # Take first up to 3 chunks as context
+                max_fallback = min(3, len(self.document_chunks))
+                for i in range(max_fallback):
+                    txt = self.document_chunks[i]
+                    meta = self.chunk_meta[i] if 0 <= i < len(self.chunk_meta) else {"page": -1, "para": i}
+                    retrieved.append(RetrievedChunk(
+                        idx=i, score=0.0, start=0, end=len(txt), text=txt,
+                        page=int(meta.get("page", -1)), para=int(meta.get("para", i))
+                    ))
+            else:
+                k = min(8, sims.size)
+                top = np.argsort(sims)[-k:][::-1]
+                for ii in top:
+                    sc = float(sims[ii])
+                    if sc < 0.15:
+                        continue
+                    txt = self.document_chunks[int(ii)]
+                    meta = self.chunk_meta[int(ii)] if 0 <= int(ii) < len(self.chunk_meta) else {"page": -1, "para": -1}
+                    retrieved.append(RetrievedChunk(
+                        idx=int(ii), score=sc, start=0, end=len(txt), text=txt,
+                        page=int(meta.get("page", -1)), para=int(meta.get("para", -1))
+                    ))
         else:
             q = self.sentence_model.encode([query]).astype("float32")
             faiss.normalize_L2(q)
@@ -303,15 +420,23 @@ class LegalBERTRAG:
             D, I = self._faiss.search(q, top_k)
             sims = D.ravel()
             ids = I.ravel()
-            retrieved = []
             for ii, sc in zip(ids, sims):
-                if ii < 0 or sc < 0.25:
+                if ii < 0 or sc < 0.15:
                     continue
                 txt = self.document_chunks[int(ii)]
-                retrieved.append(RetrievedChunk(idx=int(ii), score=float(sc), start=0, end=len(txt), text=txt))
+                meta = self.chunk_meta[int(ii)] if 0 <= int(ii) < len(self.chunk_meta) else {"page": -1, "para": -1}
+                retrieved.append(RetrievedChunk(
+                    idx=int(ii), score=float(sc), start=0, end=len(txt), text=txt,
+                    page=int(meta.get("page", -1)), para=int(meta.get("para", -1))
+                ))
 
         if not retrieved:
-            return "I don't have enough relevant information in the document to answer that question."
+            # Absolute final fallback: use raw_doc_text head
+            if self.raw_doc_text:
+                txt = self.raw_doc_text[:1400]
+                retrieved = [RetrievedChunk(idx=0, score=0.0, start=0, end=len(txt), text=txt, page=-1, para=0)]
+            else:
+                return "I don't have enough relevant information in the document to answer that question."
 
         # Build bounded context
         max_chars = 12000
@@ -324,73 +449,59 @@ class LegalBERTRAG:
             used += len(piece) + 2
         context = "\n\n".join(context_parts).strip()
         if not context:
-            return "I don't have enough relevant information in the document to answer that question."
+            # Final guard
+            first_text = retrieved.text if retrieved else (self.raw_doc_text[:1400] if self.raw_doc_text else "")
+            if not first_text:
+                return "I don't have enough relevant information in the document to answer that question."
+            context = f"[Chunk 0] {first_text}"
 
         model = _get_chat_model_name()
 
-        # Native Gemini first
+        # Native Gemini first — simple string prompt
         if self.gclient:
             try:
-                r = self.gclient.models.generate_content(
-                    model=model,
-                    contents=[
-                        {
-                            "role": "user",
-                            "parts": [
-                                (
-                                    "You are a legal AI assistant specialized in document analysis. "
-                                    "Use ONLY the provided context to answer questions about legal documents. "
-                                    "If information is not in the context, say you don't know. "
-                                    "After the answer, append a 'Citations:' section listing [Chunk id] references.\n\n"
-                                    f"CONTEXT:\n{context}\n\nQUESTION:\n{query}"
-                                )
-                            ],
-                        }
-                    ],
+                prompt = (
+                    "You are a legal AI assistant specialized in document analysis. "
+                    "Use ONLY the provided context to answer questions about legal documents. "
+                    "If information is not in the context, say you don't know. "
+                    "After the answer, append a 'Citations:' section listing [Chunk id] references.\n\n"
+                    f"CONTEXT:\n{context}\n\nQUESTION:\n{query}"
                 )
+                r = self.gclient.models.generate_content(model=model, contents=prompt)
                 content = (getattr(r, "text", "") or "").strip()
                 if content:
-                    cite_lines = [f"- [Chunk {rc.idx}] chars {rc.start}-{rc.end} (score={rc.score:.2f})" for rc in retrieved[:5]]
+                    cite_lines = [
+                        f"- [Chunk {rc.idx}] page {rc.page if rc.page>=0 else '?'} • para {rc.para if rc.para>=0 else '?'} "
+                        f"• chars {rc.start}-{rc.end} (score={rc.score:.2f})"
+                        for rc in retrieved[:5]
+                    ]
                     content += "\n\nCitations:\n" + "\n".join(cite_lines)
                     self._last_retrieved = retrieved
                     return content
             except Exception:
                 pass  # fall through
 
-        # OpenAI-compat fallback (with fixed parser)
+        # OpenAI-compat fallback
         if self.client:
-            try:
-                response = self.client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a legal AI assistant specialized in document analysis. "
-                                "Use ONLY the provided context to answer questions about legal documents. "
-                                "If information is not in the context, say you don't know. "
-                                "After the answer, append a 'Citations:' section listing [Chunk id] references used."
-                                "\n\nCONTEXT:\n" + context
-                            ),
-                        },
-                        {"role": "user", "content": query},
-                    ],
-                    max_tokens=800,
-                    temperature=0.1,
-                )
-                content = self._parse_compat_content(response)
-                if content and content.strip():
-                    cite_lines = [f"- [Chunk {rc.idx}] chars {rc.start}-{rc.end} (score={rc.score:.2f})" for rc in retrieved[:5]]
-                    content = content.strip() + "\n\nCitations:\n" + "\n".join(cite_lines)
-                    self._last_retrieved = retrieved
-                    return content
-                # If parser failed, show diagnostic preview
-                return f"Compat parse error: raw preview: {str(response)[:500]}"
-            except Exception as e:
-                # fall through to snippet mode
-                pass
+            system_prompt = (
+                "You are a legal AI assistant specialized in document analysis. "
+                "Use ONLY the provided context to answer questions about legal documents. "
+                "If information is not in the context, say you don't know. "
+                "After the answer, append a 'Citations:' section listing [Chunk id] references used.\n\n"
+                f"CONTEXT:\n{context}"
+            )
+            content = self._compat_chat(model=model, system_prompt=system_prompt, user_prompt=query)
+            if content:
+                cite_lines = [
+                    f"- [Chunk {rc.idx}] page {rc.page if rc.page>=0 else '?'} • para {rc.para if rc.para>=0 else '?'} "
+                    f"• chars {rc.start}-{rc.end} (score={rc.score:.2f})"
+                    for rc in retrieved[:5]
+                ]
+                content = content.strip() + "\n\nCitations:\n" + "\n".join(cite_lines)
+                self._last_retrieved = retrieved
+                return content
 
-        # Snippet fallback
+        # Snippet fallback — guaranteed non-error output
         self._last_retrieved = retrieved
         bullets = []
         for rc in retrieved[:5]:
@@ -400,5 +511,9 @@ class LegalBERTRAG:
         return (
             "Gemini response unavailable; returning extractive snippet summary from top sources.\n\n"
             "Summary:\n" + "\n".join(bullets) + "\n\n" +
-            "Citations:\n" + "\n".join([f"- [Chunk {rc.idx}] chars {rc.start}-{rc.end} (score={rc.score:.2f})" for rc in retrieved[:5]])
+            "Citations:\n" + "\n".join([
+                f"- [Chunk {rc.idx}] page {rc.page if rc.page>=0 else '?'} • para {rc.para if rc.para>=0 else '?'} "
+                f"• chars {rc.start}-{rc.end} (score={rc.score:.2f})"
+                for rc in retrieved[:5]
+            ])
         )
